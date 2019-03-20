@@ -12,7 +12,7 @@ def is_export(cell):
 
 def notebook2script(fname):
     fname = Path(fname)
-    fname_out = f'nb_{fname.stem.split("_")[0]}.py'
+    fname_out = f'hf_nb_{fname.stem.split("_")[1]}.py'
     main_dic = json.load(open(fname,'r'))
     code_cells = [c for c in main_dic['cells'] if is_export(c)]
     module = f'''
