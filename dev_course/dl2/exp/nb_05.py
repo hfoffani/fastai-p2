@@ -5,51 +5,70 @@
 # file to edit: dev_nb/05_anneal.ipynb
 
 from exp.nb_04 import *
-from functools import partial
 
 def create_learner(model_func, loss_func, data):
     return Learner(*model_func(data), loss_func, data)
 
 def get_model_func(lr=0.5): return partial(get_model, lr=lr)
 
-class Recorder(Callback):
-    def begin_fit(self, run):
-        run.lrs=[]
-        run.losses=[]
-        run.stats=[]
+def annealer(f):
+    def _inner(start, end): return partial(f, start, end)
+    return _inner
 
-    def after_batch(self, run):
-        if run.in_train:
-            run.lrs.append(run.opt.param_groups[-1]['lr'])
-            run.losses.append(run.loss)
+@annealer
+def sched_lin(start, end, pos): return start + pos*(end-start)
 
-def plot_lr  (run): plt.plot(run.lrs)
-def plot_loss(run): plt.plot(run.losses)
+@annealer
+def sched_cos(start, end, pos): return start + (1 + math.cos(math.pi*(1-pos))) * (end-start) / 2
+@annealer
+def sched_no(start, end, pos):  return start
+@annealer
+def sched_exp(start, end, pos): return start * (end/start) ** pos
 
-class ParamScheduler(Callback):
-    _order=1
-    def __init__(self, pname, sched_func): self.pname,self.sched_func = pname,sched_func
-
-    def set_param(self, run):
-        for pg in run.opt.param_groups:
-            pg[self.pname] = self.sched_func(run.n_epochs/run.epochs)
-
-    def begin_batch(self, run):
-        if run.in_train: self.set_param(run)
-
-import numpy as np
-
-def _sched_lin_val(start, end, pos): return start + pos*(end-start)
-def sched_lin(start, end): return partial(_sched_lin_val, start, end)
-def _sched_cos_val(start, end, pos): return start + math.cos(math.pi*pct/2.)*(end-start)
-def sched_cos(start, end): return partial(_sched_cos_val, start, end)
+#This monkey-patch is there to be able to plot tensors
+torch.Tensor.ndim = property(lambda x: len(x.shape))
 
 def combine_scheds(pcts, scheds):
     assert sum(pcts) == 1.
-    assert np.all(np.array(pcts) >= 0)
-    pcts = np.cumsum([0] + pcts)
+    pcts = tensor([0] + listify(pcts))
+    assert torch.all(pcts >= 0)
+    pcts = torch.cumsum(pcts, 0)
     def _inner(pos):
-        idx = (pos >= pcts).nonzero()[0].max()
+        idx = (pos >= pcts).nonzero().max()
         actual_pos = (pos-pcts[idx]) / (pcts[idx+1]-pcts[idx])
         return scheds[idx](actual_pos)
     return _inner
+
+class Recorder(Callback):
+    def begin_fit(self):
+        self.lrs = [[] for _ in self.opt.param_groups]
+        self.losses = []
+
+    def after_batch(self):
+        if not self.in_train: return
+        for pg,lr in zip(self.opt.param_groups,self.lrs): lr.append(pg['lr'])
+        self.losses.append(self.loss.detach().cpu())
+
+    def plot_lr  (self, pgid=-1): plt.plot(self.lrs[pgid])
+    def plot_loss(self, skip_last=0): plt.plot(self.losses[:len(self.losses)-skip_last])
+
+class ParamScheduler(Callback):
+    _order=1
+    def __init__(self, pname, sched_funcs): self.pname,self.sched_funcs = pname,sched_funcs
+
+    def begin_fit(self):
+        if not isinstance(self.sched_funcs, (list,tuple)):
+            self.sched_funcs = [self.sched_funcs] * len(self.opt.param_groups)
+
+    def set_param(self):
+        assert len(self.opt.param_groups)==len(self.sched_funcs)
+        for pg,f in zip(self.opt.param_groups,self.sched_funcs):
+            pg[self.pname] = f(self.n_epochs/self.epochs)
+
+    def begin_batch(self):
+        if self.in_train: self.set_param()
+
+def pg_dicts(pgs): return [{'params':o} for o in pgs]
+
+def cos_1cycle_anneal(start, high, end):
+    return [sched_cos(start, high), sched_cos(high, end)]

@@ -4,7 +4,7 @@
 #################################################
 # file to edit: dev_nb/06_cuda_cnn_hooks_init.ipynb
 
-from exp.nb_05 import *
+from exp.nb_05b import *
 torch.set_num_threads(2)
 
 def normalize_to(train, valid):
@@ -21,51 +21,75 @@ class Lambda(nn.Module):
 def flatten(x):      return x.view(x.shape[0], -1)
 
 class CudaCallback(Callback):
-    def begin_fit(self, run): run.model.cuda()
-    def begin_batch(self, run): run.xb,run.yb = run.xb.cuda(),run.yb.cuda()
+    def begin_fit(self): self.model.cuda()
+    def begin_batch(self): self.run.xb,self.run.yb = self.xb.cuda(),self.yb.cuda()
 
 class BatchTransformXCallback(Callback):
     _order=2
     def __init__(self, tfm): self.tfm = tfm
-    def begin_batch(self, run): run.xb = self.tfm(run.xb)
+    def begin_batch(self): self.run.xb = self.tfm(self.xb)
 
-def resize_tfm(*size):
+def view_tfm(*size):
     def _inner(x): return x.view(*((-1,)+size))
     return _inner
+
+def get_runner(model, data, lr=0.6, cbs=None, opt_func=None, loss_func = F.cross_entropy):
+    if opt_func is None: opt_func = optim.SGD
+    opt = opt_func(model.parameters(), lr=lr)
+    learn = Learner(model, opt, loss_func, data)
+    return learn, Runner(cb_funcs=listify(cbs))
 
 def children(m): return list(m.children())
 
 class Hook():
-    def __init__(self, m, f):
-        self.means = []
-        self.stds  = []
-        self.hook = m.register_forward_hook(partial(f, self))
-
+    def __init__(self, m, f): self.hook = m.register_forward_hook(partial(f, self))
     def remove(self): self.hook.remove()
     def __del__(self): self.remove()
 
+def append_stats(hook, mod, inp, outp):
+    if not hasattr(hook,'stats'): hook.stats = ([],[])
+    means,stds = hook.stats
+    means.append(outp.data.mean())
+    stds .append(outp.data.std())
+
+class ListContainer():
+    def __init__(self, items): self.items = listify(items)
+    def __getitem__(self, idx):
+        if isinstance(idx, (int,slice)): return self.items[idx]
+        if isinstance(idx[0],bool):
+            assert len(idx)==len(self) # bool mask
+            return [o for m,o in zip(idx,self.items) if m]
+        return [self.items[i] for i in idx]
+    def __len__(self): return len(self.items)
+    def __iter__(self): return iter(self.items)
+    def __setitem__(self, i, o): self.items[i] = o
+    def __delitem__(self, i): del(self.items[i])
+    def __repr__(self):
+        res = f'{self.__class__.__name__} ({len(self)} items)\n{self.items[:10]}'
+        if len(self)>10: res = res[:-1]+ '...]'
+        return res
+
 from torch.nn import init
 
-class Hooks():
-    def __init__(self, ms, f): self.hooks = [Hook(m, f) for m in ms]
-    def __getitem__(self,i): return self.hooks[i]
-    def __len__(self): return len(self.hooks)
-    def __iter__(self): return iter(self.hooks)
+class Hooks(ListContainer):
+    def __init__(self, ms, f): super().__init__([Hook(m, f) for m in ms])
     def __enter__(self, *args): return self
     def __exit__ (self, *args): self.remove()
 
-    def remove(self):
-        for h in self.hooks: h.remove()
+    def __delitem__(self, i):
+        self[i].remove()
+        super().__delitem__(i)
 
-def get_cnn_layers(data, nfs, **kwargs):
+    def remove(self):
+        for h in self: h.remove()
+
+def get_cnn_layers(data, nfs, layer, **kwargs):
     nfs = [1] + nfs
-    return [conv2d(nfs[i], nfs[i+1], **kwargs)
+    return [layer(nfs[i], nfs[i+1], 5 if i==0 else 3, **kwargs)
             for i in range(len(nfs)-1)] + [
         nn.AdaptiveAvgPool2d(1), Lambda(flatten), nn.Linear(nfs[-1], data.c)]
 
-def get_cnn_model(data, nfs, **kwargs): return nn.Sequential(*get_cnn_layers(data, nfs, **kwargs))
-
-def conv2d(ni, nf, ks=3, stride=2, **kwargs):
+def conv_layer(ni, nf, ks=3, stride=2, **kwargs):
     return nn.Sequential(
         nn.Conv2d(ni, nf, ks, padding=ks//2, stride=stride), GeneralRelu(**kwargs))
 
@@ -79,3 +103,33 @@ class GeneralRelu(nn.Module):
         if self.sub is not None: x.sub_(self.sub)
         if self.maxv is not None: x.clamp_max_(self.maxv)
         return x
+
+def init_cnn(m, uniform=False):
+    f = init.kaiming_uniform_ if uniform else init.kaiming_normal_
+    for l in m:
+        if isinstance(l, nn.Sequential):
+            f(l[0].weight, a=0.1)
+            l[0].bias.data.zero_()
+
+def get_cnn_model(data, nfs, layer, **kwargs):
+    return nn.Sequential(*get_cnn_layers(data, nfs, layer, **kwargs))
+
+def get_learn_run(nfs, data, lr, layer, cbs=None, opt_func=None, uniform=False, **kwargs):
+    model = get_cnn_model(data, nfs, layer, **kwargs)
+    init_cnn(model, uniform=uniform)
+    return get_runner(model, data, lr=lr, cbs=cbs, opt_func=opt_func)
+
+from IPython.display import display, Javascript
+def nb_auto_export():
+    display(Javascript("""{
+const ip = IPython.notebook
+if (ip) {
+    ip.save_notebook()
+    console.log('a')
+    const s = `!python notebook2script.py ${ip.notebook_name}`
+    if (ip.kernel) {
+        console.log(s)
+        ip.kernel.execute()
+    }
+}
+}"""))
