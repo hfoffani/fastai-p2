@@ -13,24 +13,28 @@ class Reference<T> {
     init(_ value: T) { self.value = value }
 }
 
-protocol LearningPhaseDependent: Layer {
+public protocol LearningPhaseDependent: FALayer {
     associatedtype Input
     associatedtype Output
     
-    //var delegate: LayerDelegate<Output> { get set }
     @differentiable func forwardTraining(to input: Input) -> Output
     @differentiable func forwardInference(to input: Input) -> Output
 }
 
 extension LearningPhaseDependent {
-    public func call(_ input: Input) -> Output {
+    // This `@differentiable` attribute is necessary, to tell the compiler that this satisfies the FALayer
+    // protocol requirement, even though there is a `@differentiating(forward)` method below.
+    // TODO: It seems nondeterministically necessary. Some subsequent notebooks import this successfully without it,
+    // some require it. Investigate.
+    @differentiable
+    public func forward(_ input: Input) -> Output {
         switch Context.local.learningPhase {
         case .training: return forwardTraining(to: input)
         case .inference: return forwardInference(to: input)
         }
     }
 
-    @differentiating(call)
+    @differentiating(forward)
     func gradForward(_ input: Input) ->
         (value: Output, pullback: (Self.Output.CotangentVector) ->
             (Self.CotangentVector, Self.Input.CotangentVector)) {
@@ -43,7 +47,7 @@ extension LearningPhaseDependent {
     }
 }
 
-protocol Norm: Layer where Input == Tensor<Scalar>, Output == Tensor<Scalar>{
+public protocol Norm: Layer where Input == Tensor<Scalar>, Output == Tensor<Scalar>{
     associatedtype Scalar
     init(featureCount: Int, epsilon: Scalar)
 }
@@ -55,7 +59,7 @@ public struct FABatchNorm<Scalar: TensorFlowFloatingPoint>: LearningPhaseDepende
     // Running statistics
     @noDerivative let runningMean: Reference<Tensor<Scalar>>
     @noDerivative let runningVariance: Reference<Tensor<Scalar>>
-    //@noDerivative public var delegate: LayerDelegate<Output> = LayerDelegate()
+    @noDerivative public var delegate: LayerDelegate<Output> = LayerDelegate()
     // Trainable parameters
     public var scale: Tensor<Scalar>
     public var offset: Tensor<Scalar>
@@ -99,12 +103,9 @@ public struct ConvBN<Scalar: TensorFlowFloatingPoint>: FALayer {
     public var norm: FABatchNorm<Scalar>
     @noDerivative public var delegate: LayerDelegate<Output> = LayerDelegate()
     
-    public init(_ cIn: Int, _ cOut: Int, ks: Int = 3, stride: Int = 2){
+    public init(_ cIn: Int, _ cOut: Int, ks: Int = 3, stride: Int = 1){
         // TODO (when control flow AD works): use Conv2D without bias
-        self.conv = FANoBiasConv2D(filterShape: (ks, ks, cIn, cOut), 
-                           strides: (stride,stride), 
-                           padding: .same, 
-                           activation: relu)
+        self.conv = FANoBiasConv2D(cIn, cOut, ks: ks, stride: stride, activation: relu)
         self.norm = FABatchNorm(featureCount: cOut, epsilon: 1e-5)
     }
 
@@ -120,10 +121,11 @@ public struct CnnModelBN: Layer {
     public var linear: FADense<Float>
     
     public init(channelIn: Int, nOut: Int, filters: [Int]){
-        convs = []
         let allFilters = [channelIn] + filters
-        for i in 0..<filters.count { convs.append(ConvBN(allFilters[i], allFilters[i+1])) }
-        linear = FADense<Float>(inputSize: filters.last!, outputSize: nOut)
+        convs = Array(0..<filters.count).map { i in
+            return ConvBN(allFilters[i], allFilters[i+1], ks: 3, stride: 2)
+        }
+        linear = FADense<Float>(filters.last!, nOut)
     }
     
     @differentiable
